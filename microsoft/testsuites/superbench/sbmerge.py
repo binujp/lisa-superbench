@@ -122,6 +122,9 @@ class Superbench():
                 db_csv_fd.write(dashboard.csv())
 
     def parse_results(self, gpu, dist, log_path):
+        sk = json.load(open(self.sku_file))
+        g = [sk[k].keys() for k in sk.keys()]
+        print(f"{gpu} {dist} {sk.keys()} {g}")
         sku_info = json.load(open(self.sku_file))[dist][gpu]
         dashboard: DashBoard = Superbench.dash_board_entry(sku_info)
 
@@ -150,18 +153,30 @@ class Superbench():
 # "--skuinfo-json <path to skuinfo.json file> describing vms under test"
 # Except for log-dir, these can be extracted from the logs.
 
-def main():
-    assert sys.argv[1]
-    log_path = sys.argv[1].rstrip("/")
-    assert os.path.isdir(log_path)
+import argparse
 
-    # [mis]use the fact that log dirs are of the form:
-    #             570_validation/a100/al3
-    #                            |     ^
-    #                           gpu    |
-    #                                  distribution
-    dist = os.path.basename(log_path)
-    gpu = os.path.basename(os.path.dirname(log_path))
+def parse_args():
+    # Initialize the parser
+    parser = argparse.ArgumentParser(description="Parse command line arguments for GPU and distribution")
+
+    # Add arguments
+    parser.add_argument('--log-dir', type=str, required=True, help='Directory where sb results are kept')
+    parser.add_argument('--gpu', type=str, required=True, help='Specify the GPU')
+    parser.add_argument('--dist', type=str, required=True, help='Specify the distribution')
+
+    # Parse the arguments
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    log_dir = args.log_dir.rstrip("/")
+    assert os.path.isdir(log_dir)
+
+    dist = args.dist
+    gpu = args.gpu
     
-    print(f"gpu:{gpu}, dist:{dist}, dirname:{os.path.dirname(log_path)}")
-    sb = Superbench(gpu, dist, log_path)
+    print(f"gpu:{gpu}, dist:{dist}, dirname:{os.path.dirname(log_dir)}")
+    sb = Superbench(gpu, dist, log_dir)
+
+main()
