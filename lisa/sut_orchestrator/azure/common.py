@@ -311,6 +311,15 @@ class AzureImageSchema(schema.ImageSchema):
             )
         ),
     )
+    encrypt_disk: Union[search_space.SetSpace[bool], bool] = field(
+        default_factory=partial(
+            search_space.SetSpace[bool], is_allow_set=True, items=[False, True]
+        ),
+        metadata=field_metadata(
+            decoder=partial(search_space.decode_set_space_by_type, base_type=bool),
+            required=False,
+        ),
+    )
 
     def load_from_platform(self, platform: "AzurePlatform") -> None:
         """
@@ -379,21 +388,28 @@ class AzureImageSchema(schema.ImageSchema):
         self, raw_features: Dict[str, Any], log: Logger
     ) -> None:
         security_profile = raw_features.get("SecurityType")
-        capabilities: List[SecurityProfileType] = []
+        security_profile_capabilities: List[SecurityProfileType] = []
+        encrypt_capability: List[bool] = [False]
         if security_profile in ["TrustedLaunchSupported", "TrustedLaunch"]:
-            capabilities.append(SecurityProfileType.Standard)
-            capabilities.append(SecurityProfileType.SecureBoot)
+            security_profile_capabilities.extend(
+                [SecurityProfileType.Standard, SecurityProfileType.SecureBoot]
+            )
         elif security_profile in (
             "TrustedLaunchAndConfidentialVmSupported",
             "ConfidentialVmSupported",
             "ConfidentialVM",
         ):
-            capabilities.append(SecurityProfileType.CVM)
-            capabilities.append(SecurityProfileType.Stateless)
+            security_profile_capabilities.extend(
+                [SecurityProfileType.CVM, SecurityProfileType.Stateless]
+            )
+            encrypt_capability.append(True)
         else:
-            capabilities.append(SecurityProfileType.Standard)
+            security_profile_capabilities.append(SecurityProfileType.Standard)
 
-        self.security_profile = search_space.SetSpace(True, capabilities)
+        self.security_profile = search_space.SetSpace(
+            True, security_profile_capabilities
+        )
+        self.encrypt_disk = search_space.SetSpace(True, encrypt_capability)
 
 
 def _get_image_tags(image: Any) -> Dict[str, Any]:
@@ -538,6 +554,7 @@ class VhdSchema(AzureImageSchema):
                     SecurityProfileType.Stateless,
                 ],
             )
+            self.encrypt_disk = search_space.SetSpace(True, [True, False])
         else:
             self.security_profile = search_space.SetSpace(
                 True,
@@ -546,6 +563,7 @@ class VhdSchema(AzureImageSchema):
                     SecurityProfileType.SecureBoot,
                 ],
             )
+            self.encrypt_disk = search_space.SetSpace(True, [False])
 
 
 @dataclass_json()
@@ -1208,6 +1226,9 @@ class AzureArmParameter:
     subnet_prefix: str = AZURE_SUBNET_PREFIX
     is_ultradisk: bool = False
     use_ipv6: bool = False
+    enable_vm_nat: bool = False
+    create_public_address: bool = True
+    source_address_prefixes: List[str] = field(default_factory=list)
 
     def __post_init__(self, *args: Any, **kwargs: Any) -> None:
         add_secret(self.admin_username, PATTERN_HEADTAIL)
@@ -1348,10 +1369,10 @@ def delete_private_zones(
                 )
                 log.debug(f"delete private zone: {private_zone_name}")
                 break
-            except Exception as identifier:
+            except Exception as e:
                 if (
                     "Can not delete resource before nested resources are deleted"
-                    in str(identifier)
+                    in str(e)
                 ):
                     sleep(1)
                     continue
@@ -1831,6 +1852,7 @@ def check_or_create_resource_group(
     location: str,
     log: Logger,
     managed_by: str = "",
+    resource_group_tags: Optional[Dict[str, str]] = None,
 ) -> None:
     with get_resource_management_client(
         credential, subscription_id, cloud
@@ -1842,7 +1864,9 @@ def check_or_create_resource_group(
         if not az_shared_rg_exists:
             log.info(f"Creating Resource group: '{resource_group_name}'")
 
-            rg_properties = {"location": location}
+            rg_properties: Dict[str, Any] = {"location": location}
+            if resource_group_tags:
+                rg_properties["tags"] = resource_group_tags
             if managed_by:
                 log.debug(f"Using managed_by resource group: '{managed_by}'")
                 rg_properties["managed_by"] = managed_by
@@ -1925,6 +1949,7 @@ def copy_vhd_to_storage(
                     platform=platform,
                 )
                 dst_vhd_sas_url = f"{full_vhd_path}?{sas_token}"
+                add_secret(dst_vhd_sas_url, PATTERN_URL)
                 log.info(f"Copying VHD using AzCopy: {dst_vhd_name}")
                 copy_vhd_using_azcopy(
                     azcopy_path=azcopy_path,
@@ -1934,9 +1959,26 @@ def copy_vhd_to_storage(
                     log=log,
                 )
             else:
-                blob_client.start_copy_from_url(
-                    src_vhd_sas_url, metadata=None, incremental_copy=False
-                )
+                # When multiple LISA runs use the same VHD URL concurrently, Azure may
+                # throw the following error during start_copy_from_url:
+                #
+                # ResourceExistsError: There is currently a pending copy operation.
+                #
+                # This happens because multiple runs attempt to copy the VHD to the same
+                # destination. Although a lock prevents this within a single LISA run,
+                # it can still occur across multiple runs. To handle this, catch the
+                # exception and gracefully continue with wait_copy_blob.
+                try:
+                    blob_client.start_copy_from_url(
+                        src_vhd_sas_url, metadata=None, incremental_copy=False
+                    )
+                except ResourceExistsError as e:
+                    if "PendingCopyOperation" in str(e):
+                        log.warning(
+                            "Pending copy operation detected. Avoid copying again"
+                        )
+                    else:
+                        raise e
 
         wait_copy_blob(blob_client, dst_vhd_name, log)
 
@@ -1964,9 +2006,9 @@ def copy_vhd_using_azcopy(
             expected_exit_code_failure_message=("AzCopy failed to copy the blob"),
             timeout=60 * 60,
         )
-    except Exception as identifier:
+    except Exception as e:
         blob_client.delete_blob(delete_snapshots="include")
-        raise LisaException(f"AzCopy error: {identifier}")
+        raise LisaException(f"AzCopy error: {e}")
 
     # Set metadata to mark the blob copied by AzCopy successfully
     metadata = {"AzCopyStatus": "Success"}
@@ -1979,7 +2021,7 @@ def wait_copy_blob(
     log: Logger,
     timeout: int = 60 * 60,
 ) -> None:
-    log.info(f"copying vhd: {vhd_path}")
+    log.info(f"Waiting for copying vhd: {vhd_path}")
     if blob_client.get_blob_properties().copy.status:
         check_till_timeout(
             lambda: blob_client.get_blob_properties().copy.status == "success",
@@ -2094,8 +2136,8 @@ def save_console_log(
                     resource_group_name=resource_group_name, vm_name=vm_name
                 )
             )
-        except ResourceExistsError as identifier:
-            log.debug(f"fail to get serial console log. {identifier}")
+        except ResourceExistsError as e:
+            log.debug(f"fail to get serial console log. {e}")
             return b""
     if saved_path:
         screenshot_raw_name = saved_path / f"{screenshot_file_name}.bmp"
@@ -2225,7 +2267,6 @@ def get_primary_ip_addresses(
     platform: "AzurePlatform",
     resource_group_name: str,
     vm: VirtualMachine,
-    use_ipv6: bool = False,
 ) -> Tuple[str, str]:
     network_client = get_network_client(platform)
 
@@ -2234,6 +2275,8 @@ def get_primary_ip_addresses(
         vm.network_profile.network_interfaces, List
     ), f"actual: {type(vm.network_profile.network_interfaces)}"
     nic_index = 0
+    use_ipv6 = platform._azure_runbook.use_ipv6
+    create_public_address = platform._azure_runbook.create_public_address
     for network_interface in vm.network_profile.network_interfaces:
         assert isinstance(
             network_interface.id, str
@@ -2243,32 +2286,33 @@ def get_primary_ip_addresses(
         if nic.primary:
             if use_ipv6:
                 nic_index = 1
-            if not nic.ip_configurations[nic_index].public_ip_address:
-                raise LisaException(f"no public address found in nic {nic.name}")
-            if (
-                use_ipv6
-                and not nic.ip_configurations[nic_index].private_ip_address_version
-                == IpProtocol.ipv6
-            ):
+
+            ip_config = nic.ip_configurations[nic_index]
+            if use_ipv6 and ip_config.private_ip_address_version != IpProtocol.ipv6:
                 raise LisaException(f"private address is not IPv6 in nic {nic.name}")
-            if nic.ip_configurations[nic_index].public_ip_address:
+            private_ip = ip_config.private_ip_address
+
+            if create_public_address:
+                if not ip_config.public_ip_address:
+                    raise LisaException(f"no public address found in nic {nic.name}")
                 public_ip_name = get_matched_str(
-                    nic.ip_configurations[nic_index].public_ip_address.id,
+                    ip_config.public_ip_address.id,
                     PATTERN_PUBLIC_IP_NAME,
                 )
-            public_ip_address = network_client.public_ip_addresses.get(
-                resource_group_name,
-                public_ip_name,
-            )
-            if (
-                use_ipv6
-                and not public_ip_address.public_ip_address_version == IpProtocol.ipv6
-            ):
-                raise LisaException(f"public address is not IPv6 in nic {nic.name}")
-            return (
-                public_ip_address.ip_address,
-                nic.ip_configurations[nic_index].private_ip_address,
-            )
+                public_ip_address = network_client.public_ip_addresses.get(
+                    resource_group_name,
+                    public_ip_name,
+                )
+                if (
+                    use_ipv6
+                    and public_ip_address.public_ip_address_version != IpProtocol.ipv6
+                ):
+                    raise LisaException(f"public address is not IPv6 in nic {nic.name}")
+
+                return public_ip_address.ip_address, private_ip
+            else:
+                return "", private_ip
+
     raise LisaException(f"fail to find primary nic for vm {vm.name}")
 
 
@@ -3255,12 +3299,12 @@ def load_location_info_from_file(
             with open(cached_file_name, "r") as f:
                 loaded_data: Dict[str, Any] = json.load(f)
             loaded_obj = schema.load_by_type(AzureLocation, loaded_data)
-        except Exception as identifier:
+        except Exception as e:
             # if schema changed, There may be exception, remove cache and retry
             # Note: retry on this method depends on decorator
-            log.debug(f"error on loading cache, delete cache and retry. {identifier}")
+            log.debug(f"error on loading cache, delete cache and retry. {e}")
             cached_file_name.unlink()
-            raise identifier
+            raise e
     return loaded_obj
 
 
