@@ -119,11 +119,36 @@ class PerfMessage(MessageBase):
     kernel_version: str = ""
     lis_version: str = ""
     ip_version: str = NetworkProtocol.IPv4
-    protocol_type: str = TransportProtocol.Tcp
+    protocol_type: Optional[str] = None
     data_path: str = ""
-    test_date: datetime = datetime.utcnow()
+    test_date: datetime = datetime.now(timezone.utc)
     role: str = ""
     test_result_id: str = ""
+
+
+class MetricRelativity(str, Enum):
+    NA = ""
+    HigherIsBetter = "HigherIsBetter"
+    LowerIsBetter = "LowerIsBetter"
+
+    @classmethod
+    def parse(cls, str_value: str) -> "MetricRelativity":
+        if str_value.upper() == cls.HigherIsBetter.upper():
+            return MetricRelativity.HigherIsBetter
+        elif str_value.upper() == cls.LowerIsBetter.upper():
+            return MetricRelativity.LowerIsBetter
+        else:
+            return MetricRelativity.NA
+
+
+@dataclass
+class UnifiedPerfMessage(PerfMessage):
+    type: str = "UnifiedPerformance"
+    metric_name: str = ""
+    metric_value: float = 0.0
+    metric_unit: str = ""
+    metric_description: str = ""
+    metric_relativity: Optional[MetricRelativity] = MetricRelativity.NA
 
 
 T = TypeVar("T", bound=PerfMessage)
@@ -179,6 +204,7 @@ class NetworkLatencyPerformanceMessage(PerfMessage):
     latency99_percentile_us: Decimal = Decimal(0)
     interval_us: int = 0
     frequency: int = 0
+    protocol_type: Optional[str] = TransportProtocol.Tcp
 
 
 @dataclass
@@ -196,6 +222,7 @@ class NetworkPPSPerformanceMessage(PerfMessage):
     fwd_pps_maximum: Decimal = Decimal(0)
     fwd_pps_average: Decimal = Decimal(0)
     fwd_pps_minimum: Decimal = Decimal(0)
+    protocol_type: Optional[str] = TransportProtocol.Tcp
 
 
 @dataclass
@@ -219,6 +246,7 @@ class NetworkTCPPerformanceMessage(PerfMessage):
     rx_throughput_in_gbps: Decimal = Decimal(0)
     retransmitted_segments: Decimal = Decimal(0)
     congestion_windowsize_kb: Decimal = Decimal(0)
+    protocol_type: Optional[str] = TransportProtocol.Tcp
 
 
 @dataclass
@@ -233,6 +261,7 @@ class NetworkUDPPerformanceMessage(PerfMessage):
     rx_throughput_in_gbps: Decimal = Decimal(0)
     data_loss: Decimal = Decimal(0)
     packet_size_kbytes: Decimal = Decimal(0)
+    protocol_type: Optional[str] = TransportProtocol.Udp
 
 
 @dataclass
@@ -284,7 +313,7 @@ class VCMetricsMessage(PerfMessage):
     scenario_end_time: datetime = datetime.now(timezone.utc)
     metric_categorization: str = ""
     metric_name: str = ""
-    metric_value: Decimal = Decimal(0)
+    metric_value: float = 0.0
     metric_unit: str = ""
     metric_description: str = ""
     metric_relativity: str = ""
@@ -356,6 +385,43 @@ def send_sub_test_result_message(
         other_fields = {}
     other_fields.update({"parent_test": test_result.runtime_data.name})
     dict_to_fields(other_fields, message)
+
+    notifier.notify(message)
+
+    return message
+
+
+def send_unified_perf_message(
+    node: "Node",
+    test_result: "TestResult",
+    test_case_name: str = "",
+    metric_name: str = "",
+    metric_value: float = 0.0,
+    metric_unit: str = "",
+    metric_description: str = "",
+    metric_relativity: Optional[MetricRelativity] = MetricRelativity.NA,
+    tool: str = "",
+    protocol_type: Optional[str] = None,
+) -> UnifiedPerfMessage:
+    other_fields = {}
+    if protocol_type is not None:
+        other_fields["protocol_type"] = protocol_type
+
+    message = create_perf_message(
+        message_type=UnifiedPerfMessage,
+        node=node,
+        test_result=test_result,
+        test_case_name=test_case_name,
+        other_fields=other_fields if other_fields else None,
+    )
+
+    message.metric_name = metric_name
+    message.metric_value = metric_value
+    message.metric_unit = metric_unit
+    message.metric_description = metric_description
+    message.metric_relativity = metric_relativity
+
+    message.tool = tool
 
     notifier.notify(message)
 
